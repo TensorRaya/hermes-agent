@@ -1461,7 +1461,38 @@ def _resolve_endpoint_context_length(
         context_length = matched.get("context_length")
         if isinstance(context_length, int):
             return context_length
+    # LiteLLM's OpenAI listing may omit cost-map metadata. Only query after
+    # exact membership in the authenticated listing; never fuzzy-authorize.
+    if model in endpoint_metadata:
+        return _query_litellm_model_info(model, base_url, api_key)
     return None
+
+
+def _query_litellm_model_info(model: str, base_url: str, api_key: str) -> Optional[int]:
+    try:
+        _ensure_requests()
+        base = base_url.rstrip("/")
+        if base.endswith("/v1"):
+            base = base[:-3]
+        headers = {"Authorization": "Bearer " + api_key} if api_key else {}
+        response = requests.get(base + "/model/info", headers=headers,
+                                timeout=(5, 10), verify=_resolve_requests_verify(base_url))
+        try:
+            response.raise_for_status()
+            limits = []
+            for entry in response.json().get("data", []):
+                if entry.get("model_name") != model:
+                    continue
+                value = entry.get("model_info", {}).get("max_input_tokens")
+                if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                    limits.append(value)
+            # Advertise the largest route capacity; LiteLLM's enabled pre-call
+            # checks must exclude smaller deployments for that request.
+            return max(limits) if limits else None
+        finally:
+            response.close()
+    except Exception:
+        return None
 
 
 def _get_context_cache_path() -> Path:
@@ -1511,8 +1542,6 @@ def save_context_length(model: str, base_url: str, length: int) -> None:
         return
     key = _context_cache_key(model, base_url)
     cache = _load_context_cache()
-    if cache.get(key) == length:
-        return  # already stored
     cache[key] = length
     path = _get_context_cache_path()
     try:
@@ -1522,10 +1551,49 @@ def save_context_length(model: str, base_url: str, length: int) -> None:
         # resulting YAML error and returns {} — silently wiping EVERY cached
         # context length. It also exposes torn reads to a concurrent process
         # reading between truncate and dump-complete.
-        atomic_yaml_write(path, {"context_lengths": cache})
+        try:
+            old = yaml.safe_load(path.read_text()) or {}
+            observed = old.get("observed_at", {})
+        except Exception:
+            observed = {}
+        observed[key] = time.time()
+        atomic_yaml_write(path, {"context_lengths": cache, "observed_at": observed})
         logger.info("Cached context length %s -> %s tokens", key, f"{length:,}")
     except Exception as e:
         logger.debug("Failed to save context length cache: %s", e)
+
+
+def _context_cache_is_fresh(model: str, base_url: str) -> bool:
+    """Legacy caches lack provenance; never treat them as fresh metadata."""
+    try:
+        data = yaml.safe_load(_get_context_cache_path().read_text()) or {}
+        at = data.get("observed_at", {}).get(_context_cache_key(model, base_url))
+        return isinstance(at, (int, float)) and 0 <= time.time() - at < 3600
+    except Exception:
+        return False
+
+
+def _bedrock_catalog_input_limit(model: str) -> Optional[int]:
+    """Input budget is separate from total context; never reserve output twice.
+
+    Prefer the explicit provider input cap when available, otherwise its context.
+    No network in this hot path: picker/catalog refresh owns catalog fetching.
+    """
+    try:
+        from agent.models_dev import fetch_models_dev
+        data = fetch_models_dev(allow_network=False)
+        models = data.get("amazon-bedrock", {}).get("models", {})
+        entry = models.get(model)
+        if not entry:
+            bare = re.sub(r"^(global|us|eu|apac)\.", "", model)
+            entry = models.get(bare)
+        limits = (entry or {}).get("limit", {})
+        value = limits.get("input") or limits.get("context")
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value
+    except Exception:
+        pass
+    return None
 
 
 def get_cached_context_length(model: str, base_url: str) -> Optional[int]:
@@ -2860,6 +2928,11 @@ def get_model_context_length(
         and base_url_host_matches(base_url, "amazonaws.com")
     )
 
+    if is_bedrock_context:
+        catalog_limit = _bedrock_catalog_input_limit(model)
+        if catalog_limit:
+            return catalog_limit
+
     # 1. Check persistent cache (model+provider)
     # LM Studio is excluded — its loaded context length is transient (the
     # user can reload the model with a different context_length at any time
@@ -2868,6 +2941,13 @@ def get_model_context_length(
     # account-specific and a fallback must never suppress later revalidation.
     if base_url and not _skip_persistent_context_cache(base_url, provider):
         cached = get_cached_context_length(model, base_url)
+        # A bounded cache cannot permanently mask backend changes. Known local
+        # endpoints retain their existing live reconciliation path.
+        if (cached is not None and cached > 0
+                and (is_bedrock_context or provider in {"custom", "litellm"})
+                and not is_local_endpoint(base_url)
+                and not _context_cache_is_fresh(model, base_url)):
+            cached = None
         if cached is not None:
             # Reject non-positive cached values — a 0 or negative value
             # is always a bug (corrupted cache, probe failure, or manual
@@ -2972,7 +3052,7 @@ def get_model_context_length(
             # bedrock:// key so display/offline paths share the entry.
             cache_key_url = base_url or "bedrock://"
             cached = get_cached_context_length(model, cache_key_url)
-            if cached is not None:
+            if cached is not None and _context_cache_is_fresh(model, cache_key_url):
                 return cached
             # Resolve region from the base_url host first, then the standard
             # AWS region chain.  An empty region disables probing (table only).
@@ -2986,13 +3066,14 @@ def get_model_context_length(
                     region = resolve_bedrock_region()
                 except Exception:
                     region = ""
-            ctx = get_bedrock_context_length(model, region=region, probe=bool(region))
-            if ctx and region:
-                # Only persist probe-derived values (region present); a pure
-                # table fallback shouldn't poison the cache against a later
-                # successful probe.
+            from agent.bedrock_adapter import probe_bedrock_context_length
+            # Persist only a real parsed provider response, never a table or
+            # generic fallback merely because the region is configured.
+            ctx = probe_bedrock_context_length(model, region) if region else None
+            if ctx:
                 save_context_length(model, cache_key_url, ctx)
-            return ctx
+                return ctx
+            return get_bedrock_context_length(model, region=region, probe=False)
 
     if provider == "novita" or (base_url and base_url_host_matches(base_url, "api.novita.ai")):
         ctx = _resolve_endpoint_context_length(model, base_url or "https://api.novita.ai/openai/v1", api_key=api_key)
